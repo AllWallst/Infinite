@@ -2,51 +2,84 @@ import streamlit as st
 import json
 import random
 import pandas as pd
+import base64
 from openai import OpenAI
+from urllib.parse import urlencode
 
 # ==========================================
-# 1. CONFIGURATION & STATE INITIALIZATION
+# 1. CONFIGURATION & URL DECODING
 # ==========================================
 st.set_page_config(
-    page_title="Infinite Tabletop v4.1",
-    page_icon="🪙",
+    page_title="Infinite Tabletop v4.2",
+    page_icon="🔗",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 st.markdown("""
 <style>
-    /* UI Polish */
     .stChatMessage { border-radius: 15px; padding: 15px; background-color: #262730; border: 1px solid #444; }
     div.stButton > button { width: 100%; border-radius: 6px; font-weight: 600; }
     .gold-text { color: #FFD700; font-weight: bold; font-family: monospace; font-size: 1.2em; }
+    .stToast { background-color: #2b2b2b !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# Lists for Dropdowns
+# --- TIMELINE FORK LOADER (URL HANDLING) ---
+# We check this BEFORE initializing default state to override if needed
+query_params = st.query_params
+seed_payload = None
+fork_success = False
+
+if "seed" in query_params:
+    try:
+        # Decode Base64 -> JSON string -> Dictionary
+        decoded_bytes = base64.b64decode(query_params["seed"])
+        decoded_str = decoded_bytes.decode('utf-8')
+        seed_payload = json.loads(decoded_str)
+        fork_success = True
+    except Exception as e:
+        st.error(f"⚠️ Timeline Fork Failed: {e}")
+
+# ==========================================
+# 2. STATE INITIALIZATION
+# ==========================================
 RACES = ["Human", "Elf", "Dwarf", "Halfling", "Orc", "Tiefling", "Dragonborn", "Gnome", "Tabaxi", "Warforged"]
 CLASSES = ["Fighter", "Wizard", "Rogue", "Cleric", "Bard", "Paladin", "Ranger", "Barbarian", "Druid", "Sorcerer", "Monk", "Warlock"]
 RANDOM_NAMES = ["Thorne", "Elara", "Grom", "Vex", "Lyra", "Kael", "Seraphina", "Durnik", "Zane", "Mirella"]
 
-# Default State Setup
-DEFAULT_STATE = {
-    "history": [],
-    "game_started": False,
-    # System
-    "api_key": "",
-    "custom_model_id": "", # No defaults, user must provide
-    # Character
-    "char_name": "",
-    "char_race": "Human",
-    "char_class": "Fighter",
-    "hp_curr": 10,
-    "hp_max": 10,
-    "gold": 0,
-    "inventory_df": pd.DataFrame([
+# Determine Initial Values (Default vs Seeded)
+init_char_name = seed_payload.get("char_name", "") if seed_payload else ""
+init_char_race = seed_payload.get("char_race", "Human") if seed_payload else "Human"
+init_char_class = seed_payload.get("char_class", "Fighter") if seed_payload else "Fighter"
+init_hp_curr = seed_payload.get("hp_curr", 10) if seed_payload else 10
+init_hp_max = seed_payload.get("hp_max", 10) if seed_payload else 10
+init_gold = seed_payload.get("gold", 0) if seed_payload else 0
+init_history = seed_payload.get("history", []) if seed_payload else []
+init_game_started = True if seed_payload else False
+
+# Inventory: Seed (List of Dicts) -> DataFrame, or Default DataFrame
+if seed_payload and "inventory_data" in seed_payload:
+    init_inv_df = pd.DataFrame(seed_payload["inventory_data"])
+else:
+    init_inv_df = pd.DataFrame([
         {"Item": "Rations (1 day)", "Value": "5sp", "Rarity": "Common"},
         {"Item": "Waterskin", "Value": "2sp", "Rarity": "Common"},
         {"Item": "Dagger", "Value": "2gp", "Rarity": "Common"}
-    ]),
+    ])
+
+DEFAULT_STATE = {
+    "history": init_history,
+    "game_started": init_game_started,
+    "api_key": "",
+    "custom_model_id": "", 
+    "char_name": init_char_name,
+    "char_race": init_char_race,
+    "char_class": init_char_class,
+    "hp_curr": init_hp_curr,
+    "hp_max": init_hp_max,
+    "gold": init_gold,
+    "inventory_df": init_inv_df,
     "char_img": "https://image.pollinations.ai/prompt/mysterious%20adventurer%20fantasy%20art?nologo=true"
 }
 
@@ -54,8 +87,11 @@ for key, val in DEFAULT_STATE.items():
     if key not in st.session_state:
         st.session_state[key] = val
 
+if fork_success:
+    st.toast("🌍 Parallel Universe Loaded. Enter API Key to Resume.", icon="⚡")
+
 # ==========================================
-# 2. HELPER FUNCTIONS
+# 3. LOGIC & HELPERS
 # ==========================================
 def generate_image_url(prompt):
     clean_prompt = prompt.replace(" ", "%20")
@@ -63,47 +99,61 @@ def generate_image_url(prompt):
     return f"https://image.pollinations.ai/prompt/{clean_prompt}%20{style}?nologo=true"
 
 def roll_starting_gold():
-    """Rolls a D20 to determine starting wealth bracket."""
     roll = random.randint(1, 20)
     if roll <= 5: amount = 10
     elif roll <= 10: amount = 25
     elif roll <= 15: amount = 50
     elif roll <= 19: amount = 100
-    else: amount = 500 # Critical Success
-    
+    else: amount = 500
     st.session_state.gold = amount
-    st.toast(f"🪙 Wealth Roll: {roll}. You start with {amount} Gold Coins!", icon="💰")
-    return roll, amount
+    return amount
+
+def generate_share_link():
+    """Serializes current state into a base64 URL parameter"""
+    # 1. Convert Inventory DF to simple list of dicts
+    inv_data = st.session_state.inventory_df.to_dict(orient="records")
+    
+    # 2. Grab only necessary state (Limit history to last 2 turns to prevent URL bloat)
+    short_history = st.session_state.history[-4:] if len(st.session_state.history) > 4 else st.session_state.history
+    
+    payload = {
+        "char_name": st.session_state.char_name,
+        "char_race": st.session_state.char_race,
+        "char_class": st.session_state.char_class,
+        "hp_curr": st.session_state.hp_curr,
+        "hp_max": st.session_state.hp_max,
+        "gold": st.session_state.gold,
+        "inventory_data": inv_data,
+        "history": short_history
+    }
+    
+    # 3. Encode
+    json_str = json.dumps(payload)
+    b64_str = base64.b64encode(json_str.encode()).decode()
+    
+    # 4. Construct Link (Assumes running locally or on standard port, change base_url for production)
+    base_url = "http://localhost:8501" # REPLACE with actual Streamlit Share URL if deployed
+    return f"{base_url}?seed={b64_str}"
 
 def get_dm_response(user_input, dice_result=None):
     if not st.session_state.api_key or not st.session_state.custom_model_id:
         return "⚠️ **SYSTEM ERROR:** Credentials missing."
 
     client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=st.session_state.api_key)
-    
-    # Parse Inventory DF to string for Context
     inv_str = st.session_state.inventory_df.to_string(index=False)
     
     sys_prompt = f"""
     You are the Infinite Dungeon Master.
+    HERO: {st.session_state.char_name} ({st.session_state.char_race} {st.session_state.char_class})
+    STATUS: HP {st.session_state.hp_curr}/{st.session_state.hp_max} | Gold: {st.session_state.gold}gp
+    BAG: {inv_str}
     
-    HERO CONTEXT:
-    Name: {st.session_state.char_name} | Race: {st.session_state.char_race} | Class: {st.session_state.char_class}
-    HP: {st.session_state.hp_curr}/{st.session_state.hp_max} | Gold: {st.session_state.gold} gp
-    INVENTORY:
-    {inv_str}
-    
-    DIRECTIVES:
-    1. Act as a D&D 5e DM. Narrate clearly and vividly.
-    2. Manage the player's currency. If they buy something, narrate the gold deduction.
-    3. If a dice roll is sent, interpret it strictly.
-    4. End scene descriptions with [IMAGE: <visual description>]
+    TASK: Narrate the adventure. Manage gold/loot. End scenes with [IMAGE: description].
     """
 
     messages = [{"role": "system", "content": sys_prompt}] + st.session_state.history
-    
     if dice_result:
-        messages.append({"role": "user", "content": f"[SYSTEM EVENT: User rolled a {dice_result}.]"})
+        messages.append({"role": "user", "content": f"[SYSTEM EVENT: Rolled {dice_result}.]"})
 
     try:
         completion = client.chat.completions.create(
@@ -117,126 +167,100 @@ def get_dm_response(user_input, dice_result=None):
         return f"⚠️ **Connection Failed:** {str(e)}"
 
 # ==========================================
-# 3. SIDEBAR (SETUP & SHEET)
+# 4. SIDEBAR & GATEKEEPER
 # ==========================================
 with st.sidebar:
-    st.title("🧙‍♂️ Infinite Tabletop v4.1")
+    st.title("🧙‍♂️ Infinite Tabletop v4.2")
     
-    # --- SECTION 1: NEURAL ENGINE (GATEKEEPER) ---
-    with st.expander("⚙️ Neural Engine (REQUIRED)", expanded=not st.session_state.game_started):
-        st.info("Enter credentials to unlock the adventure.")
+    # --- GATEKEEPER ---
+    # We expand this if the key is missing OR if we just loaded a seed (to prompt user to enter key)
+    with st.expander("⚙️ Neural Engine (REQUIRED)", expanded=not bool(st.session_state.api_key)):
+        st.info("Credentials required to animate the world.")
+        temp_key = st.text_input("OpenRouter Key", value=st.session_state.api_key, type="password")
+        temp_model = st.text_input("Custom Model ID", value=st.session_state.custom_model_id, placeholder="vendor/model-name")
         
-        # Temp inputs to allow "Save" button logic
-        temp_key = st.text_input("OpenRouter API Key", value=st.session_state.api_key, type="password")
-        temp_model = st.text_input("Custom Model ID", value=st.session_state.custom_model_id, placeholder="e.g. meta-llama/llama-3.1-70b-instruct:free")
-        
-        if st.button("💾 Save Connection Settings"):
+        if st.button("💾 Connect Neural Link"):
             st.session_state.api_key = temp_key
             st.session_state.custom_model_id = temp_model
             if temp_key and temp_model:
-                st.toast("Neural Link Established. AI Context Refreshed.", icon="🧠")
+                st.toast("Connected!", icon="🟢")
                 st.rerun()
             else:
-                st.error("Both Key and Model ID are required.")
+                st.error("Missing credentials.")
 
-    # --- BLOCKER: STOP IF NO CREDENTIALS ---
     if not st.session_state.api_key or not st.session_state.custom_model_id:
-        st.warning("⚠️ Please configure the Neural Engine above to begin.")
+        st.warning("⚠️ Enter credentials above to proceed.")
         st.stop()
 
-    # --- SECTION 2: CHARACTER SHEET ---
-    tab_char, tab_inv, tab_sys = st.tabs(["👤 Hero", "🎒 Bag", "💾 System"])
+    # --- TABS ---
+    tab_char, tab_inv, tab_sys = st.tabs(["👤 Hero", "🎒 Bag", "🔗 System"])
     
     with tab_char:
-        # Character Identity
-        st.caption("Identity")
         c1, c2 = st.columns([3, 1])
         st.session_state.char_name = c1.text_input("Name", st.session_state.char_name)
-        if c2.button("🎲", help="Auto-Name"):
+        if c2.button("🎲"):
             st.session_state.char_name = random.choice(RANDOM_NAMES)
             st.rerun()
-            
         st.session_state.char_race = st.selectbox("Race", RACES, index=RACES.index(st.session_state.char_race) if st.session_state.char_race in RACES else 0)
         st.session_state.char_class = st.selectbox("Class", CLASSES, index=CLASSES.index(st.session_state.char_class) if st.session_state.char_class in CLASSES else 0)
         
-        st.divider()
-        st.caption("Vitals")
         vc1, vc2 = st.columns(2)
-        st.session_state.hp_curr = vc1.number_input("HP Current", value=st.session_state.hp_curr)
+        st.session_state.hp_curr = vc1.number_input("HP Curr", value=st.session_state.hp_curr)
         st.session_state.hp_max = vc2.number_input("HP Max", value=st.session_state.hp_max)
-        
-        st.markdown(f"<div class='gold-text'>🪙 Gold: {st.session_state.gold} gp</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='gold-text'>🪙 Gold: {st.session_state.gold}</div>", unsafe_allow_html=True)
 
     with tab_inv:
-        st.caption("Inventory Management")
-        # Data Editor for structured inventory
-        edited_df = st.data_editor(
+        st.session_state.inventory_df = st.data_editor(
             st.session_state.inventory_df, 
             num_rows="dynamic", 
             use_container_width=True,
             column_config={
-                "Item": st.column_config.TextColumn("Item Name"),
-                "Value": st.column_config.TextColumn("Value"),
-                "Rarity": st.column_config.SelectboxColumn("Rarity", options=["Common", "Uncommon", "Rare", "Epic", "Legendary"])
+                "Rarity": st.column_config.SelectboxColumn("Rarity", options=["Common", "Uncommon", "Rare", "Legendary"])
             }
         )
-        # Update state with edits
-        st.session_state.inventory_df = edited_df
 
     with tab_sys:
-        st.caption("Save/Load")
-        # Serialize DataFrame for JSON save
+        st.caption("Persistence")
+        # Standard JSON Save
         save_state = {k:v for k,v in st.session_state.items() if k not in ["api_key", "inventory_df"]}
         save_state["inventory_data"] = st.session_state.inventory_df.to_dict(orient="records")
+        st.download_button("💾 Save File", json.dumps(save_state), "save.json")
         
-        st.download_button("💾 Save Game", json.dumps(save_state), "save_v4.1.json")
-        
-        uploaded = st.file_uploader("📂 Load Game", type=["json"])
-        if uploaded:
-            try:
-                data = json.load(uploaded)
-                for k,v in data.items():
-                    if k == "inventory_data":
-                        st.session_state.inventory_df = pd.DataFrame(v)
-                    else:
-                        st.session_state[k] = v
-                st.success("Loaded!")
-                st.rerun()
-            except: st.error("Bad File")
+        st.divider()
+        st.caption("Multiplayer (Timeline Forking)")
+        if st.button("🔗 Create Share Link"):
+            link = generate_share_link()
+            st.code(link, language=None)
+            st.success("Link generated! Anyone with this link starts from this exact moment.")
 
 # ==========================================
-# 4. GAME START SEQUENCE
+# 5. GAME START OR RESUME
 # ==========================================
-# If game hasn't started, show the "Begin" button to roll gold and init prompt
 if not st.session_state.game_started:
     st.title("✨ Begin Your Adventure")
     st.markdown(f"**Hero:** {st.session_state.char_name or 'Nameless'} the {st.session_state.char_race} {st.session_state.char_class}")
     
-    if st.button("🎲 Roll for Starting Gold & Begin Game", type="primary"):
+    if st.button("🎲 Roll Gold & Start", type="primary"):
         if not st.session_state.char_name:
-            st.error("Please name your character first!")
+            st.error("Name your hero first!")
         else:
             roll_starting_gold()
             st.session_state.game_started = True
-            
-            # Initial Prompt Injection
-            intro_prompt = f"I am {st.session_state.char_name}, a Level 1 {st.session_state.char_race} {st.session_state.char_class}. I have {st.session_state.gold} gold pieces. Start the adventure in a tavern or dungeon entrance. Describe the scene."
-            st.session_state.history.append({"role": "user", "content": intro_prompt})
-            
-            with st.spinner("Summoning the world..."):
-                resp = get_dm_response(intro_prompt)
-                st.session_state.history.append({"role": "assistant", "content": resp})
+            intro = f"I am {st.session_state.char_name}, a Level 1 {st.session_state.char_race} {st.session_state.char_class}. I have {st.session_state.gold} gold. Start the story."
+            st.session_state.history.append({"role": "user", "content": intro})
+            with st.spinner("World building..."):
+                st.session_state.history.append({"role": "assistant", "content": get_dm_response(intro)})
             st.rerun()
-    st.stop() # Halt rendering the rest until clicked
+else:
+    # If loaded from link, show title
+    st.title(f"The Saga of {st.session_state.char_name}")
 
 # ==========================================
-# 5. MAIN GAME LOOP
+# 6. MAIN CHAT LOOP
 # ==========================================
-st.title(f"The Saga of {st.session_state.char_name}")
-
-# Render Chat
+# Render History
 for msg in st.session_state.history:
-    if msg["role"] == "user" and "Start the adventure" in msg["content"]: continue # Hide setup prompt
+    if msg["role"] == "user" and "Start the story" in msg["content"]: continue
     
     with st.chat_message(msg["role"], avatar="🧙‍♂️" if msg["role"] == "assistant" else "🗡️"):
         content = msg["content"]
@@ -250,21 +274,19 @@ for msg in st.session_state.history:
             st.markdown(content)
 
 # Input
-if prompt := st.chat_input("What do you do?"):
+if prompt := st.chat_input("Action..."):
     st.session_state.history.append({"role": "user", "content": prompt})
     with st.chat_message("user", avatar="🗡️"):
         st.markdown(prompt)
     
     with st.chat_message("assistant", avatar="🧙‍♂️"):
-        with st.spinner("DM is thinking..."):
-            response = get_dm_response(prompt)
-            if "[IMAGE:" in response:
-                parts = response.split("[IMAGE:")
+        with st.spinner("Rolling..."):
+            resp = get_dm_response(prompt)
+            if "[IMAGE:" in resp:
+                parts = resp.split("[IMAGE:")
                 st.markdown(parts[0].strip())
                 if len(parts) > 1:
-                    img_prompt = parts[1].split("]")[0].strip()
-                    st.image(generate_image_url(img_prompt), use_container_width=True)
+                    st.image(generate_image_url(parts[1].split("]")[0]), use_container_width=True)
             else:
-                st.markdown(response)
-    
-    st.session_state.history.append({"role": "assistant", "content": response})
+                st.markdown(resp)
+    st.session_state.history.append({"role": "assistant", "content": resp})
