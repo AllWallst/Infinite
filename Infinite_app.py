@@ -1,59 +1,53 @@
 import streamlit as st
 import json
-import base64
 import random
-import requests
-from datetime import datetime
+import pandas as pd
 from openai import OpenAI
 
 # ==========================================
-# 1. VISUAL CONFIGURATION
+# 1. CONFIGURATION & STATE INITIALIZATION
 # ==========================================
 st.set_page_config(
-    page_title="The Infinite Tabletop v4",
-    page_icon="🐉",
+    page_title="Infinite Tabletop v4.1",
+    page_icon="🪙",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 st.markdown("""
 <style>
-    /* Immersion Tweaks */
+    /* UI Polish */
     .stChatMessage { border-radius: 15px; padding: 15px; background-color: #262730; border: 1px solid #444; }
-    div.stButton > button { width: 100%; border-radius: 8px; font-weight: bold; }
-    
-    /* Dice Buttons */
-    .dice-btn { background-color: #444; color: white; }
-    
-    /* Character Card */
-    .char-card { border: 1px solid #555; padding: 10px; border-radius: 10px; text-align: center; margin-bottom: 10px; }
+    div.stButton > button { width: 100%; border-radius: 6px; font-weight: 600; }
+    .gold-text { color: #FFD700; font-weight: bold; font-family: monospace; font-size: 1.2em; }
 </style>
 """, unsafe_allow_html=True)
 
-# ==========================================
-# 2. STATE MANAGEMENT
-# ==========================================
-DM_MODELS = {
-    "Llama 3.1 70B (Free)": "meta-llama/llama-3.1-70b-instruct:free",
-    "Claude 3.5 Sonnet": "anthropic/claude-3.5-sonnet",
-    "GPT-4o": "openai/gpt-4o",
-    "Mistral Large": "mistralai/mistral-large",
-    "Custom...": "custom"
-}
+# Lists for Dropdowns
+RACES = ["Human", "Elf", "Dwarf", "Halfling", "Orc", "Tiefling", "Dragonborn", "Gnome", "Tabaxi", "Warforged"]
+CLASSES = ["Fighter", "Wizard", "Rogue", "Cleric", "Bard", "Paladin", "Ranger", "Barbarian", "Druid", "Sorcerer", "Monk", "Warlock"]
+RANDOM_NAMES = ["Thorne", "Elara", "Grom", "Vex", "Lyra", "Kael", "Seraphina", "Durnik", "Zane", "Mirella"]
 
+# Default State Setup
 DEFAULT_STATE = {
     "history": [],
-    "char_name": "Traveler",
-    "char_class": "Commoner",
+    "game_started": False,
+    # System
+    "api_key": "",
+    "custom_model_id": "", # No defaults, user must provide
+    # Character
+    "char_name": "",
     "char_race": "Human",
-    "char_stats": "STR:10 DEX:10 CON:10 INT:10 WIS:10 CHA:10",
+    "char_class": "Fighter",
     "hp_curr": 10,
     "hp_max": 10,
-    "inventory": "Rations, Waterskin, Dagger",
-    "char_img": "https://image.pollinations.ai/prompt/mysterious%20hooded%20figure%20fantasy%20art?nologo=true",
-    "api_key": "",
-    "selected_model_label": "Llama 3.1 70B (Free)",
-    "custom_model_id": "",
+    "gold": 0,
+    "inventory_df": pd.DataFrame([
+        {"Item": "Rations (1 day)", "Value": "5sp", "Rarity": "Common"},
+        {"Item": "Waterskin", "Value": "2sp", "Rarity": "Common"},
+        {"Item": "Dagger", "Value": "2gp", "Rarity": "Common"}
+    ]),
+    "char_img": "https://image.pollinations.ai/prompt/mysterious%20adventurer%20fantasy%20art?nologo=true"
 }
 
 for key, val in DEFAULT_STATE.items():
@@ -61,228 +55,190 @@ for key, val in DEFAULT_STATE.items():
         st.session_state[key] = val
 
 # ==========================================
-# 3. CORE LOGIC ENGINE
+# 2. HELPER FUNCTIONS
 # ==========================================
 def generate_image_url(prompt):
-    """Pollinations.ai API for dynamic visuals"""
     clean_prompt = prompt.replace(" ", "%20")
-    style = "fantasy%20rpg%20character%20portrait,%20dnd%205e,%20oil%20painting,%20masterpiece"
+    style = "fantasy%20rpg%20character%20portrait,%20dnd%205e,%20oil%20painting"
     return f"https://image.pollinations.ai/prompt/{clean_prompt}%20{style}?nologo=true"
 
-def get_active_model():
-    """Resolves the model ID based on user selection"""
-    label = st.session_state.selected_model_label
-    if label == "Custom...":
-        return st.session_state.custom_model_id
-    return DM_MODELS[label]
-
-def ai_generate_character():
-    """Uses the LLM to auto-roll a full character"""
-    if not st.session_state.api_key:
-        st.error("⚠️ API Key required for Neural Generation.")
-        return
-
-    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=st.session_state.api_key)
+def roll_starting_gold():
+    """Rolls a D20 to determine starting wealth bracket."""
+    roll = random.randint(1, 20)
+    if roll <= 5: amount = 10
+    elif roll <= 10: amount = 25
+    elif roll <= 15: amount = 50
+    elif roll <= 19: amount = 100
+    else: amount = 500 # Critical Success
     
-    prompt = """
-    Create a unique, interesting D&D 5e Level 1 Character. 
-    Return ONLY a JSON object (no markdown) with these exact keys:
-    {
-        "name": "String",
-        "race": "String",
-        "class": "String",
-        "stats": "String (e.g. 'STR:16 DEX:14...')",
-        "hp": Integer,
-        "inventory": "String list of items",
-        "visual_description": "String describing appearance for an art generator"
-    }
-    """
-    
-    try:
-        with st.spinner("Forging a new soul..."):
-            response = client.chat.completions.create(
-                model="meta-llama/llama-3.1-70b-instruct:free", # Use a cheap/free model for gen
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.9
-            )
-            content = response.choices[0].message.content
-            # Clean potential markdown wrapping
-            content = content.replace("```json", "").replace("```", "").strip()
-            data = json.loads(content)
-            
-            # Update State
-            st.session_state.char_name = data.get("name", "Unknown")
-            st.session_state.char_race = data.get("race", "Human")
-            st.session_state.char_class = data.get("class", "Fighter")
-            st.session_state.char_stats = data.get("stats", "Standard Array")
-            st.session_state.hp_max = data.get("hp", 10)
-            st.session_state.hp_curr = data.get("hp", 10)
-            st.session_state.inventory = data.get("inventory", "None")
-            
-            # Generate Portrait
-            desc = data.get("visual_description", f"{st.session_state.char_race} {st.session_state.char_class}")
-            st.session_state.char_img = generate_image_url(desc)
-            st.toast("New Character Generated!", icon="✨")
-            st.rerun()
-            
-    except Exception as e:
-        st.error(f"Generation Failed: {e}")
+    st.session_state.gold = amount
+    st.toast(f"🪙 Wealth Roll: {roll}. You start with {amount} Gold Coins!", icon="💰")
+    return roll, amount
 
 def get_dm_response(user_input, dice_result=None):
-    """The Main Game Loop"""
-    if not st.session_state.api_key:
-        return "⚠️ **SYSTEM HALT:** Please configure your API Key in the System Tab."
+    if not st.session_state.api_key or not st.session_state.custom_model_id:
+        return "⚠️ **SYSTEM ERROR:** Credentials missing."
 
     client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=st.session_state.api_key)
     
-    # Context Injection
+    # Parse Inventory DF to string for Context
+    inv_str = st.session_state.inventory_df.to_string(index=False)
+    
     sys_prompt = f"""
     You are the Infinite Dungeon Master.
     
     HERO CONTEXT:
-    Name: {st.session_state.char_name} ({st.session_state.char_race} {st.session_state.char_class})
-    Stats: {st.session_state.char_stats}
-    HP: {st.session_state.hp_curr}/{st.session_state.hp_max}
-    Inventory: {st.session_state.inventory}
+    Name: {st.session_state.char_name} | Race: {st.session_state.char_race} | Class: {st.session_state.char_class}
+    HP: {st.session_state.hp_curr}/{st.session_state.hp_max} | Gold: {st.session_state.gold} gp
+    INVENTORY:
+    {inv_str}
     
     DIRECTIVES:
-    1. Narrate the story with sensory details.
-    2. If a dice roll is provided, adjudicate the result strictly.
-    3. If a new scene/monster appears, end with: [IMAGE: <visual prompt>]
+    1. Act as a D&D 5e DM. Narrate clearly and vividly.
+    2. Manage the player's currency. If they buy something, narrate the gold deduction.
+    3. If a dice roll is sent, interpret it strictly.
+    4. End scene descriptions with [IMAGE: <visual description>]
     """
 
     messages = [{"role": "system", "content": sys_prompt}] + st.session_state.history
     
     if dice_result:
-        messages.append({"role": "user", "content": f"[SYSTEM EVENT: User rolled a {dice_result}. Result?]"})
+        messages.append({"role": "user", "content": f"[SYSTEM EVENT: User rolled a {dice_result}.]"})
 
     try:
         completion = client.chat.completions.create(
-            model=get_active_model(),
+            model=st.session_state.custom_model_id,
             messages=messages,
             extra_headers={"HTTP-Referer": "https://infinite-tabletop.streamlit.app"},
             temperature=0.8
         )
         return completion.choices[0].message.content
     except Exception as e:
-        return f"⚠️ **Connection Lost:** {str(e)}"
-
-def roll_dice(sides):
-    res = random.randint(1, sides)
-    st.toast(f"Rolled {res} (d{sides})")
-    
-    # Add to history invisible to user prompt, or as a system note
-    st.session_state.history.append({"role": "user", "content": f"🎲 **I rolled a {res} on a d{sides}!**"})
-    
-    # Trigger DM
-    with st.spinner("The Fates decide..."):
-        resp = get_dm_response(None, dice_result=res)
-        st.session_state.history.append({"role": "assistant", "content": resp})
-    st.rerun()
+        return f"⚠️ **Connection Failed:** {str(e)}"
 
 # ==========================================
-# 4. SIDEBAR - THE COMMAND DECK
+# 3. SIDEBAR (SETUP & SHEET)
 # ==========================================
 with st.sidebar:
-    st.title("🧙‍♂️ Infinite Tabletop v4")
+    st.title("🧙‍♂️ Infinite Tabletop v4.1")
     
-    tab_hero, tab_play, tab_sys = st.tabs(["👤 Hero", "🎲 Play", "⚙️ System"])
+    # --- SECTION 1: NEURAL ENGINE (GATEKEEPER) ---
+    with st.expander("⚙️ Neural Engine (REQUIRED)", expanded=not st.session_state.game_started):
+        st.info("Enter credentials to unlock the adventure.")
+        
+        # Temp inputs to allow "Save" button logic
+        temp_key = st.text_input("OpenRouter API Key", value=st.session_state.api_key, type="password")
+        temp_model = st.text_input("Custom Model ID", value=st.session_state.custom_model_id, placeholder="e.g. meta-llama/llama-3.1-70b-instruct:free")
+        
+        if st.button("💾 Save Connection Settings"):
+            st.session_state.api_key = temp_key
+            st.session_state.custom_model_id = temp_model
+            if temp_key and temp_model:
+                st.toast("Neural Link Established. AI Context Refreshed.", icon="🧠")
+                st.rerun()
+            else:
+                st.error("Both Key and Model ID are required.")
+
+    # --- BLOCKER: STOP IF NO CREDENTIALS ---
+    if not st.session_state.api_key or not st.session_state.custom_model_id:
+        st.warning("⚠️ Please configure the Neural Engine above to begin.")
+        st.stop()
+
+    # --- SECTION 2: CHARACTER SHEET ---
+    tab_char, tab_inv, tab_sys = st.tabs(["👤 Hero", "🎒 Bag", "💾 System"])
     
-    # --- TAB 1: HERO (THE SOUL FORGE) ---
-    with tab_hero:
-        # Portrait
-        st.image(st.session_state.char_img, caption=st.session_state.char_name, use_container_width=True)
-        
-        # Generator
-        if st.button("✨ Auto-Generate New Hero", help="Uses AI to create a full character"):
-            ai_generate_character()
-        
-        st.divider()
-        
-        # Manual Edit
-        c1, c2 = st.columns(2)
+    with tab_char:
+        # Character Identity
+        st.caption("Identity")
+        c1, c2 = st.columns([3, 1])
         st.session_state.char_name = c1.text_input("Name", st.session_state.char_name)
-        st.session_state.char_class = c2.text_input("Class", st.session_state.char_class)
-        st.session_state.char_race = st.text_input("Race", st.session_state.char_race)
+        if c2.button("🎲", help="Auto-Name"):
+            st.session_state.char_name = random.choice(RANDOM_NAMES)
+            st.rerun()
+            
+        st.session_state.char_race = st.selectbox("Race", RACES, index=RACES.index(st.session_state.char_race) if st.session_state.char_race in RACES else 0)
+        st.session_state.char_class = st.selectbox("Class", CLASSES, index=CLASSES.index(st.session_state.char_class) if st.session_state.char_class in CLASSES else 0)
         
-        c3, c4 = st.columns(2)
-        st.session_state.hp_curr = c3.number_input("HP Now", value=st.session_state.hp_curr)
-        st.session_state.hp_max = c4.number_input("HP Max", value=st.session_state.hp_max)
-        
-        st.session_state.char_stats = st.text_area("Stats", st.session_state.char_stats, height=70)
-        st.session_state.inventory = st.text_area("Inventory", st.session_state.inventory, height=100)
-        
-        # Character Persistence (Load/Save ONLY Character Data)
         st.divider()
-        st.caption("Soul Jar (Character Only)")
+        st.caption("Vitals")
+        vc1, vc2 = st.columns(2)
+        st.session_state.hp_curr = vc1.number_input("HP Current", value=st.session_state.hp_curr)
+        st.session_state.hp_max = vc2.number_input("HP Max", value=st.session_state.hp_max)
         
-        char_data = {k: v for k, v in st.session_state.items() if k.startswith("char_") or k in ["hp_curr", "hp_max", "inventory"]}
-        st.download_button("💾 Export Character", json.dumps(char_data), "character.json")
-        
-        uploaded_char = st.file_uploader("📂 Import Character", type=["json"])
-        if uploaded_char:
-            try:
-                d = json.load(uploaded_char)
-                for k, v in d.items(): st.session_state[k] = v
-                st.success("Soul Imported!")
-                st.rerun()
-            except: st.error("Invalid Soul File")
+        st.markdown(f"<div class='gold-text'>🪙 Gold: {st.session_state.gold} gp</div>", unsafe_allow_html=True)
 
-    # --- TAB 2: PLAY (DICE) ---
-    with tab_play:
-        st.subheader("Dice Tray")
-        col1, col2, col3 = st.columns(3)
-        if col1.button("d4"): roll_dice(4)
-        if col2.button("d6"): roll_dice(6)
-        if col3.button("d8"): roll_dice(8)
-        
-        col4, col5, col6 = st.columns(3)
-        if col4.button("d10"): roll_dice(10)
-        if col5.button("d12"): roll_dice(12)
-        if col6.button("d20", type="primary"): roll_dice(20)
-        
-        st.info("Dice rolls are immediately sent to the DM to influence the narrative.")
+    with tab_inv:
+        st.caption("Inventory Management")
+        # Data Editor for structured inventory
+        edited_df = st.data_editor(
+            st.session_state.inventory_df, 
+            num_rows="dynamic", 
+            use_container_width=True,
+            column_config={
+                "Item": st.column_config.TextColumn("Item Name"),
+                "Value": st.column_config.TextColumn("Value"),
+                "Rarity": st.column_config.SelectboxColumn("Rarity", options=["Common", "Uncommon", "Rare", "Epic", "Legendary"])
+            }
+        )
+        # Update state with edits
+        st.session_state.inventory_df = edited_df
 
-    # --- TAB 3: SYSTEM (SETTINGS & CAMPAIGN) ---
     with tab_sys:
-        st.subheader("Neural Engine")
-        st.session_state.api_key = st.text_input("OpenRouter Key", value=st.session_state.api_key, type="password")
+        st.caption("Save/Load")
+        # Serialize DataFrame for JSON save
+        save_state = {k:v for k,v in st.session_state.items() if k not in ["api_key", "inventory_df"]}
+        save_state["inventory_data"] = st.session_state.inventory_df.to_dict(orient="records")
         
-        # Custom Model Logic
-        st.session_state.selected_model_label = st.selectbox("LLM Model", list(DM_MODELS.keys()))
-        if st.session_state.selected_model_label == "Custom...":
-            st.session_state.custom_model_id = st.text_input("Enter Model ID (e.g. vendor/model-name)", value=st.session_state.custom_model_id)
-
-        st.divider()
-        st.subheader("Campaign State")
-        st.caption("Saves the entire game history + character.")
+        st.download_button("💾 Save Game", json.dumps(save_state), "save_v4.1.json")
         
-        # Campaign Save
-        full_state = {k:v for k,v in st.session_state.items() if k != "api_key"}
-        st.download_button("💾 Save Campaign", json.dumps(full_state), "campaign_v4.json")
-        
-        # Campaign Load
-        uploaded_game = st.file_uploader("📂 Load Campaign", type=["json"], key="game_load")
-        if uploaded_game:
+        uploaded = st.file_uploader("📂 Load Game", type=["json"])
+        if uploaded:
             try:
-                d = json.load(uploaded_game)
-                for k,v in d.items(): st.session_state[k] = v
-                st.success("Timeline Restored!")
+                data = json.load(uploaded)
+                for k,v in data.items():
+                    if k == "inventory_data":
+                        st.session_state.inventory_df = pd.DataFrame(v)
+                    else:
+                        st.session_state[k] = v
+                st.success("Loaded!")
                 st.rerun()
-            except: st.error("Corrupted Timeline")
+            except: st.error("Bad File")
 
 # ==========================================
-# 5. MAIN NARRATIVE UI
+# 4. GAME START SEQUENCE
 # ==========================================
-if not st.session_state.history:
-    st.session_state.history.append({
-        "role": "assistant", 
-        "content": f"The adventure begins. You are {st.session_state.char_name}, a {st.session_state.char_race} {st.session_state.char_class}. Where are you?"
-    })
+# If game hasn't started, show the "Begin" button to roll gold and init prompt
+if not st.session_state.game_started:
+    st.title("✨ Begin Your Adventure")
+    st.markdown(f"**Hero:** {st.session_state.char_name or 'Nameless'} the {st.session_state.char_race} {st.session_state.char_class}")
+    
+    if st.button("🎲 Roll for Starting Gold & Begin Game", type="primary"):
+        if not st.session_state.char_name:
+            st.error("Please name your character first!")
+        else:
+            roll_starting_gold()
+            st.session_state.game_started = True
+            
+            # Initial Prompt Injection
+            intro_prompt = f"I am {st.session_state.char_name}, a Level 1 {st.session_state.char_race} {st.session_state.char_class}. I have {st.session_state.gold} gold pieces. Start the adventure in a tavern or dungeon entrance. Describe the scene."
+            st.session_state.history.append({"role": "user", "content": intro_prompt})
+            
+            with st.spinner("Summoning the world..."):
+                resp = get_dm_response(intro_prompt)
+                st.session_state.history.append({"role": "assistant", "content": resp})
+            st.rerun()
+    st.stop() # Halt rendering the rest until clicked
+
+# ==========================================
+# 5. MAIN GAME LOOP
+# ==========================================
+st.title(f"The Saga of {st.session_state.char_name}")
 
 # Render Chat
 for msg in st.session_state.history:
-    with st.chat_message(msg["role"], avatar="🧙‍♂️" if msg["role"] == "assistant" else st.session_state.char_img):
+    if msg["role"] == "user" and "Start the adventure" in msg["content"]: continue # Hide setup prompt
+    
+    with st.chat_message(msg["role"], avatar="🧙‍♂️" if msg["role"] == "assistant" else "🗡️"):
         content = msg["content"]
         if "[IMAGE:" in content:
             parts = content.split("[IMAGE:")
@@ -293,14 +249,14 @@ for msg in st.session_state.history:
         else:
             st.markdown(content)
 
-# Input Area
+# Input
 if prompt := st.chat_input("What do you do?"):
     st.session_state.history.append({"role": "user", "content": prompt})
-    with st.chat_message("user", avatar=st.session_state.char_img):
+    with st.chat_message("user", avatar="🗡️"):
         st.markdown(prompt)
-        
+    
     with st.chat_message("assistant", avatar="🧙‍♂️"):
-        with st.spinner("The DM is thinking..."):
+        with st.spinner("DM is thinking..."):
             response = get_dm_response(prompt)
             if "[IMAGE:" in response:
                 parts = response.split("[IMAGE:")
